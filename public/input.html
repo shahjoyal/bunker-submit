@@ -772,18 +772,19 @@ if(localStorage.getItem('isLoggedIn') !== 'true') {
 
 <!-- Calculation script (keeps all existing logic but now pulls oxide/GCV/cost from DB if available) -->
 <script>
-/* Minimal full script that:
-   - uses generationTop (single generation input)
-   - uses bunkerCapacity (single bunker capacity value used for all bunkers)
-   - calculates blended GCV/AFT/heatRate/cost etc and updates hidden summary fields
-   - computes Next Blend per bunker (not saved to DB) as:
-       nextBlend_hours = (sum_of_column_percent_as_fraction) * bunkerCapacity / coalFlow_for_that_bunker
-     displays Next Blend as countdown H:MM
-   - preserves save behavior: builds payload identical to earlier (does NOT include nextBlend)
+/* Replacement script — copy & paste this entire <s block
+   into your HTML (replace the existing script). It preserves all original
+   functionality (GCV/AFT/cost/heatRate, PDF export, save payload, select coloring)
+   and only changes:
+     - how colours are placed into bunker: the 3rd coal (row 3) appears at the bottom,
+       row2 in middle, row1 on top (visual hierarchy reversed compared to dropdown order)
+     - timers are independent per bunker and consume bottom -> middle -> top sequentially
+     - visual "consumption" effect: the active layer's visible height shrinks as its timer runs
 */
 
 /* ---------- Helper / config ---------- */
 const DEFAULT_COAL_COLORS = ["#f39c12","#3498db","#2ecc71","#ef4444","#8b5cf6","#14b8a6","#f97316","#06b6d4"];
+
 function calcAFT(ox){
   const total = Object.values(ox).reduce((a,b)=>a+b,0);
   if(total === 0) return 0;
@@ -800,7 +801,7 @@ function calcAFT(ox){
 }
 
 function getCoalObjForRow(r){
-  const sel=document.getElementById(`coalName${r}`);
+  const sel = document.getElementById(`coalName${r}`);
   if(!sel || !sel.value) return null;
   const db = window.COAL_DB || [];
   let found = db.find(c => String(c._id) === String(sel.value));
@@ -808,18 +809,7 @@ function getCoalObjForRow(r){
   return found || null;
 }
 
-/* ---------- Next Blend timers ---------- */
-/* ---------- Next Blend timers (continuous countdown, always restart) ---------- */
-const nextBlendTimers = new Array(6).fill(null);
-
-function clearTimerForIndex(i){
-  const t = nextBlendTimers[i];
-  if(t && t.intervalId) {
-    clearInterval(t.intervalId);
-  }
-  nextBlendTimers[i] = null;
-}
-
+/* ---------- small util ---------- */
 function formatHMS(sec) {
   const s = Math.max(0, Math.floor(sec));
   const hrs = Math.floor(s / 3600);
@@ -828,118 +818,227 @@ function formatHMS(sec) {
   return `${String(hrs).padStart(2,'0')}:${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
 }
 
-function updateTimerDisplay(i, seconds){
-  const el = document.getElementById(`nextBlend${i}`);
-  if(!el) return;
-  if(!isFinite(seconds) || seconds <= 0){
-    el.value = '--';
-    el.dataset.seconds = 0;
+/* ---------- Per-bunker sequential timers (bottom -> middle -> top) ---------- */
+/* bunkerTimers[b] = {
+     layersSeconds: [botSec, midSec, topSec],
+     currentLayer: index (0..2 where 0 => bottom),
+     layerRemaining: seconds,
+     intervalId: window.setInterval id,
+     lastConfig: {layersSeconds, flow, bunkerCapacity}
+} */
+const bunkerTimers = new Array(6).fill(null);
+let lastGlobalBunkerCapacity = parseFloat(document.getElementById('bunkerCapacity')?.value) || 0;
+
+function clearBunkerTimer(i){
+  const t = bunkerTimers[i];
+  if(t && t.intervalId) clearInterval(t.intervalId);
+  bunkerTimers[i] = null;
+}
+function arraysEqualRounded(a,b){
+  if(!a && !b) return true;
+  if(!a || !b) return false;
+  if(a.length !== b.length) return false;
+  for(let i=0;i<a.length;i++){
+    if(Math.abs((a[i]||0) - (b[i]||0)) > 1) return false; // allow small rounding diffs
+  }
+  return true;
+}
+
+/* ---------- Bunker visual painting (keeps dropdown coloring behavior) ----------
+   Visual hierarchy: row3 -> bottom, row2 -> middle, row1 -> top
+   We preserve the select background colouring exactly as before.
+*/
+function updateBunkerColors(){
+  const db = window.COAL_DB || [];
+  // determine colors for rows 1..3 (these colors are mapped to the dropdowns as before)
+  const rowColors = [];
+  for(let r=1;r<=3;r++){
+    const sel = document.getElementById(`coalName${r}`);
+    let color = DEFAULT_COAL_COLORS[(r-1) % DEFAULT_COAL_COLORS.length];
+    if(sel && sel.value){
+      const found = db.find(c => String(c._id) === String(sel.value) || String(c.coal||'').toLowerCase() === String(sel.value).toLowerCase());
+      if(found && (found.color || found.colour || found.hex)) color = found.color || found.colour || found.hex;
+    }
+    rowColors[r-1] = color;
+    // color the select background to keep original behaviour
+    if(sel){
+      sel.style.background = color;
+      const c = color.replace('#','');
+      const rch = parseInt(c.substring(0,2),16), gch = parseInt(c.substring(2,4),16), bch = parseInt(c.substring(4,6),16);
+      const lum = 0.2126*rch + 0.7152*gch + 0.0722*bch;
+      sel.style.color = (lum < 140) ? '#fff' : '#111';
+    }
+  }
+
+  // paint bunker SVGs: read percentages for each bunker and draw stacked rects.
+  // We use the HTML structure that already exists (six .bunker elements each containing an <svg>).
+  const svgWidth = 100, svgHeight = 150, topY = 10, midY = 100, bottomY = 140, usableH = bottomY - topY;
+  const outlinePath = `M10 ${topY} L10 ${midY} L45 ${bottomY} L55 ${bottomY} L90 ${midY} L90 ${topY} Z`;
+
+  const bunkers = document.querySelectorAll('.bunker');
+  bunkers.forEach((bunkerEl, bIndex) => {
+    const svg = bunkerEl.querySelector('svg');
+    if(!svg) return;
+    // percentages: row1 (top), row2 (mid), row3 (bottom)
+    const pTop = parseFloat(document.querySelector(`.percentage-input[data-row="1"][data-mill="${bIndex}"]`)?.value) || 0;
+    const pMid = parseFloat(document.querySelector(`.percentage-input[data-row="2"][data-mill="${bIndex}"]`)?.value) || 0;
+    const pBot = parseFloat(document.querySelector(`.percentage-input[data-row="3"][data-mill="${bIndex}"]`)?.value) || 0;
+    // order for drawing bottom-up is [bottom, middle, top] => indices refer to rowColors: row3->index2, row2->index1, row1->index0
+    const percentages = [pTop, pMid, pBot];
+    const clipId = `clip-bunker-${bIndex}`;
+    let inner = `<defs><clipPath id="${clipId}"><path d="${outlinePath}" /></clipPath></defs>`;
+
+    // Determine visible heights based on timer (shrink active layer)
+    const timer = bunkerTimers[bIndex];
+    // compute full heights for bottom, mid, top
+    const fullBottomH = (Math.max(0, Math.min(100, pBot)) / 100) * usableH;
+    const fullMidH = (Math.max(0, Math.min(100, pMid)) / 100) * usableH;
+    const fullTopH = (Math.max(0, Math.min(100, pTop)) / 100) * usableH;
+    const fullHeights = [fullBottomH, fullMidH, fullTopH]; // bottom, mid, top order for drawing
+
+    // We'll draw bottom first, then mid, then top stacking from bottomY upwards.
+    let cum = 0;
+    for(let layerIdx=0; layerIdx<3; layerIdx++){
+      const fullH = fullHeights[layerIdx];
+      if(fullH <= 0) continue;
+      // by default visibleH = fullH
+      let visibleH = fullH;
+      if(timer){
+        // timer.currentLayer is 0 => bottom, 1=> mid, 2=>top (same indexing)
+        if(layerIdx < timer.currentLayer) {
+          visibleH = 0; // fully consumed earlier layer
+        } else if(layerIdx === timer.currentLayer) {
+          const totalForLayer = timer.layersSeconds[layerIdx] || 1;
+          const remaining = timer.layerRemaining || 0;
+          visibleH = fullH * Math.max(0, remaining / Math.max(1, totalForLayer));
+        } else {
+          visibleH = fullH; // untouched upper layers
+        }
+      }
+      const y = bottomY - (cum + visibleH);
+      cum += visibleH;
+      const fillColor = rowColors[2 - layerIdx] || DEFAULT_COAL_COLORS[(2 - layerIdx) % DEFAULT_COAL_COLORS.length];
+      // rowColors mapping: row1->index0, row2->index1, row3->index2.
+      // layerIdx 0 => bottom -> row3 => rowColors[2], etc.
+      if(visibleH > 0){
+        inner += `<rect x="0" y="${y}" width="${svgWidth}" height="${visibleH}" fill="${fillColor}" clip-path="url(#${clipId})" />`;
+      }
+    }
+
+    // outlines/edges
+    inner += `<path d="M10 ${topY} L10 ${midY}" stroke="black" fill="none" stroke-width="2" />`;
+    inner += `<path d="M90 ${topY} L90 ${midY}" stroke="black" fill="none" stroke-width="2" />`;
+    inner += `<path d="M10 ${midY} L45 ${bottomY}" stroke="black" fill="none" stroke-width="2" />`;
+    inner += `<path d="M90 ${midY} L55 ${bottomY}" stroke="black" fill="none" stroke-width="2" />`;
+
+    svg.setAttribute('viewBox', `0 0 ${svgWidth} ${svgHeight}`);
+    svg.innerHTML = inner;
+  });
+}
+
+/* ---------- Timer logic: compute per-layer durations and start/maintain independent timers ---------- */
+
+/* Compute seconds for each layer (bottom, mid, top) for bunker index b:
+   formula: hours = ((pct/100) * bunkerCapacity) / flow  -> seconds = hours * 3600
+*/
+function computeLayerSeconds(b){
+  const bunkerCapacity = parseFloat(document.getElementById('bunkerCapacity')?.value) || 0;
+  const flow = parseFloat(document.querySelector(`.flow-input[data-mill="${b}"]`)?.value) || 0;
+  const pTop = parseFloat(document.querySelector(`.percentage-input[data-row="1"][data-mill="${b}"]`)?.value) || 0;
+  const pMid = parseFloat(document.querySelector(`.percentage-input[data-row="2"][data-mill="${b}"]`)?.value) || 0;
+  const pBot = parseFloat(document.querySelector(`.percentage-input[data-row="3"][data-mill="${b}"]`)?.value) || 0;
+
+  const pctArr = [pBot, pMid, pTop]; // order bottom, mid, top
+  const seconds = pctArr.map(p => {
+    if(flow <= 0 || bunkerCapacity <= 0 || p <= 0) return 0;
+    const hours = (p / 100.0) * bunkerCapacity / flow;
+    return hours * 3600;
+  });
+  return seconds;
+}
+
+/* Start or restart a bunker sequence only for that bunker.
+   - If config hasn't changed (rounded), we leave the timer running (important for independence).
+*/
+function startOrUpdateBunkerTimer(b, layerSeconds, flow, bunkerCapacity){
+  // normalize input
+  const normalized = layerSeconds.map(s => Math.max(0, Math.round(s)));
+  const existing = bunkerTimers[b];
+  const newCfg = { layersSeconds: normalized.slice(), flow: flow||0, bunkerCapacity: bunkerCapacity||0 };
+
+  // if an existing timer is running and config matches, do nothing (preserve independence)
+  if(existing && existing.intervalId && existing.lastConfig && arraysEqualRounded(existing.lastConfig.layersSeconds, newCfg.layersSeconds) && Math.abs((existing.lastConfig.flow||0)-(newCfg.flow||0))<1e-6 && Math.abs((existing.lastConfig.bunkerCapacity||0)-(newCfg.bunkerCapacity||0))<1e-6){
     return;
   }
+
+  // otherwise clear existing and start fresh sequence
+  clearBunkerTimer(b);
+  // find first non-zero layer to start at (should be bottom index 0 if any bottom >0)
+  let startIndex = 0;
+  while(startIndex < normalized.length && (normalized[startIndex] || 0) <= 0) startIndex++;
+  if(startIndex >= normalized.length){
+    // no layers to consume
+    updateNextBlendDisplay(b, 0);
+    updateBunkerColors(); // render static fill
+    return;
+  }
+
+  const timerObj = {
+    layersSeconds: normalized,       // [bot, mid, top]
+    currentLayer: startIndex,
+    layerRemaining: Math.max(0, normalized[startIndex] || 0),
+    lastConfig: newCfg,
+    intervalId: null
+  };
+
+  // immediate render and display
+  updateBunkerColors();
+  updateNextBlendDisplay(b, timerObj.layerRemaining);
+
+  timerObj.intervalId = setInterval(() => {
+    // tick
+    if(timerObj.layerRemaining > 0){
+      timerObj.layerRemaining--;
+    }
+    // if finished current layer -> advance
+    if(timerObj.layerRemaining <= 0){
+      timerObj.currentLayer++;
+      if(timerObj.currentLayer >= timerObj.layersSeconds.length){
+        // finished all layers
+        clearBunkerTimer(b);
+        updateNextBlendDisplay(b, 0);
+        updateBunkerColors();
+        return;
+      }
+      timerObj.layerRemaining = Math.max(0, timerObj.layersSeconds[timerObj.currentLayer] || 0);
+      // update immediately after switching
+      updateBunkerColors();
+      updateNextBlendDisplay(b, timerObj.layerRemaining);
+      return;
+    }
+    // update visuals as layer shrinks
+    updateBunkerColors();
+    updateNextBlendDisplay(b, timerObj.layerRemaining);
+  }, 1000);
+
+  bunkerTimers[b] = timerObj;
+}
+
+function updateNextBlendDisplay(b, seconds){
+  const el = document.getElementById(`nextBlend${b}`);
+  if(!el) return;
+  if(!isFinite(seconds) || seconds <= 0){ el.value = '--'; el.dataset.seconds = 0; return; }
   el.value = formatHMS(seconds);
   el.dataset.seconds = Math.max(0, Math.floor(seconds));
 }
 
-/*
- startTimerForIndex:
-  - Always restarts the countdown to the provided seconds (per your request).
-  - Uses endTime = Date.now() + seconds*1000 and computes remaining via that endTime.
-  - One interval per bunker, updating every 1 second until it reaches zero.
-*/
-function startTimerForIndex(i, seconds){
-  // normalize
-  if(!isFinite(seconds) || seconds <= 0){
-    clearTimerForIndex(i);
-    updateTimerDisplay(i, 0);
-    return;
-  }
-  // clear any existing timer first (we want fresh countdown)
-  clearTimerForIndex(i);
-
-  const totalSec = Math.max(0, Math.round(seconds));
-  const endTime = Date.now() + (totalSec * 1000);
-
-  // immediate update
-  const remainingNow = Math.max(0, Math.round((endTime - Date.now()) / 1000));
-  updateTimerDisplay(i, remainingNow);
-
-  const id = setInterval(() => {
-    const rem = Math.max(0, Math.round((endTime - Date.now()) / 1000));
-    updateTimerDisplay(i, rem);
-    if(rem <= 0) {
-      clearTimerForIndex(i);
-    }
-  }, 1000);
-
-  nextBlendTimers[i] = {
-    intervalId: id,
-    endTime: endTime
-  };
-}
-
-
-/* ---------- Read single bunker capacity input ---------- */
+/* ---------- Main calculation (blended GCV/AFT/heatRate/cost) + timer orchestration ---------- */
 function getSingleBunkerCapacity(){
   const el = document.getElementById('bunkerCapacity');
   if(!el) return 0;
   return parseFloat(el.value) || 0;
 }
 
-/* ---------- Bunker fill (keeps basic coloring by row) ---------- */
-function updateBunkerColors(){
-  // Determine colors for row 1..3 (look into window.COAL_DB or use palette)
-  const db = window.COAL_DB || [];
-  const rowColors = [];
-  for(let r=1;r<=3;r++){
-    const sel = document.getElementById(`coalName${r}`);
-    let color = null;
-    if(sel && sel.value){
-      // try DB color
-      const found = db.find(c => String(c._id) === String(sel.value) || String(c.coal||'').toLowerCase() === String(sel.value).toLowerCase());
-      if(found && (found.color || found.colour || found.hex)) color = found.color || found.colour || found.hex;
-      else color = DEFAULT_COAL_COLORS[(r-1) % DEFAULT_COAL_COLORS.length];
-    } else {
-      color = DEFAULT_COAL_COLORS[(r-1) % DEFAULT_COAL_COLORS.length];
-    }
-    rowColors[r-1] = color;
-    // color the select background to make mapping interpretable (if sel exists)
-    if(sel){ sel.style.background = color; const c = color.replace('#',''); const rch=parseInt(c.substring(0,2),16), gch=parseInt(c.substring(2,4),16), bch=parseInt(c.substring(4,6),16); const lum = 0.2126*rch + 0.7152*gch + 0.0722*bch; sel.style.color = (lum < 140) ? '#fff' : '#111'; }
-  }
-
-  // paint bunker svg layers using rowColors
-  const svgWidth=100, svgHeight=150, topY=10, midY=100, bottomY=140, usableH = bottomY - topY;
-  const outlinePath = `M10 ${topY} L10 ${midY} L45 ${bottomY} L55 ${bottomY} L90 ${midY} L90 ${topY} Z`;
-  for(let b=0;b<6;b++){
-    const bunker = document.querySelectorAll('.bunker')[b];
-    if(!bunker) continue;
-    const svg = bunker.querySelector('svg');
-    if(!svg) continue;
-    const p1 = parseFloat(document.querySelector(`.percentage-input[data-row="1"][data-mill="${b}"]`)?.value)||0;
-    const p2 = parseFloat(document.querySelector(`.percentage-input[data-row="2"][data-mill="${b}"]`)?.value)||0;
-    const p3 = parseFloat(document.querySelector(`.percentage-input[data-row="3"][data-mill="${b}"]`)?.value)||0;
-    const percentages = [p1,p2,p3];
-    const clipId = `clip-bunker-${b}`;
-    let inner = `<defs><clipPath id="${clipId}"><path d="${outlinePath}" /></clipPath></defs>`;
-    let cum=0; const rects=[];
-    for(let i=0;i<percentages.length;i++){
-      const pct = Math.max(0, Math.min(100, percentages[i])); if(pct===0) continue;
-      const h = (pct/100)*usableH;
-      const y = bottomY - (cum + h);
-      cum += h;
-      const fill = rowColors[i] || DEFAULT_COAL_COLORS[i % DEFAULT_COAL_COLORS.length];
-      rects.push(`<rect x="0" y="${y}" width="${svgWidth}" height="${h}" fill="${fill}" clip-path="url(#${clipId})" />`);
-    }
-    inner += rects.join('\n');
-    inner += `<path d="M10 ${topY} L10 ${midY}" stroke="black" fill="none" stroke-width="2" />`;
-    inner += `<path d="M90 ${topY} L90 ${midY}" stroke="black" fill="none" stroke-width="2" />`;
-    inner += `<path d="M10 ${midY} L45 ${bottomY}" stroke="black" fill="none" stroke-width="2" />`;
-    inner += `<path d="M90 ${midY} L55 ${bottomY}" stroke="black" fill="none" stroke-width="2" />`;
-    svg.setAttribute('viewBox', `0 0 ${svgWidth} ${svgHeight}`);
-    svg.innerHTML = inner;
-  }
-}
-
-/* ---------- Main calculation: blended GCV/AFT/heatRate/nextBlend ---------- */
 function calculateBlended(){
   const gcv1_input = document.getElementById('gcvBox1');
   const gcv2_input = document.getElementById('gcvBox2');
@@ -953,8 +1052,12 @@ function calculateBlended(){
   const oxKeys = ["SiO2","Al2O3","Fe2O3","CaO","MgO","Na2O","K2O","SO3","TiO2"];
   let totalFlow = 0, weightedGCV = 0, weightedAFT = 0, contributedAFTFlow = 0;
 
-  // read single bunker capacity input (one value for all bunkers)
   const bunkerCapacity = getSingleBunkerCapacity();
+  const flowVals = [];
+
+  // detect capacity change (if global bunkerCapacity changed, we will restart timers for all bunkers)
+  const capacityChanged = Math.abs((bunkerCapacity || 0) - (lastGlobalBunkerCapacity || 0)) > 1e-6;
+  if(capacityChanged) lastGlobalBunkerCapacity = bunkerCapacity;
 
   for(let m=0;m<6;m++){
     const p1 = parseFloat(document.querySelector(`.percentage-input[data-row="1"][data-mill="${m}"]`)?.value) || 0;
@@ -980,6 +1083,7 @@ function calculateBlended(){
     }
 
     const flow = parseFloat(document.querySelector(`.flow-input[data-mill="${m}"]`)?.value) || 0;
+    flowVals[m] = flow;
     if(flow > 0){
       totalFlow += flow;
       weightedGCV += (flow * blendedGCV);
@@ -987,40 +1091,39 @@ function calculateBlended(){
       const aftValNumeric = (aftText !== '--') ? (parseFloat(aftText)||0) : null;
       if(aftValNumeric !== null){ weightedAFT += (flow * aftValNumeric); contributedAFTFlow += flow; }
     }
+  }
 
-    // NEXT BLEND using single bunkerCapacity
-    const sumPerc = (p1 + p2 + p3) / 100.0; // fraction
-const nextBlendEl = document.getElementById(`nextBlend${m}`);
-if(nextBlendEl){
-  if(flow > 0 && bunkerCapacity > 0){
-    const nbHours = (sumPerc * bunkerCapacity) / flow; // hours
-    if(isFinite(nbHours) && nbHours > 0){
-      const seconds = nbHours * 3600;
-      // ALWAYS restart the timer so it counts down from the newly computed value
-      startTimerForIndex(m, seconds);
+  // handle timers for each bunker individually
+  for(let m=0;m<6;m++){
+    const layersSec = computeLayerSeconds(m); // [bottom, mid, top]
+    const flow = flowVals[m] || 0;
+    const existing = bunkerTimers[m];
+    if(capacityChanged){
+      // when global capacity changed, restart per user's request
+      if(layersSec.some(s => s > 1)) startOrUpdateBunkerTimer(m, layersSec, flow, bunkerCapacity);
+      else clearBunkerTimer(m);
     } else {
-      clearTimerForIndex(m);
-      nextBlendEl.value = '--';
-      nextBlendEl.dataset.seconds = 0;
+      // only start/restart if config changed
+      const existingCfg = existing ? existing.lastConfig : null;
+      if(!existingCfg || !arraysEqualRounded(existingCfg.layersSeconds, layersSec) || Math.abs((existingCfg.flow||0)-flow) > 1e-6){
+        if(layersSec.some(s => s > 1)) startOrUpdateBunkerTimer(m, layersSec, flow, bunkerCapacity);
+        else clearBunkerTimer(m);
+      }
+      // otherwise leave it running independently
     }
-  } else {
-    clearTimerForIndex(m);
-    nextBlendEl.value = '--';
-    nextBlendEl.dataset.seconds = 0;
   }
-}
-  }
+
+  // update visuals and metrics
+  updateBunkerColors();
 
   const avgGCV = totalFlow > 0 ? (weightedGCV / totalFlow) : 0;
   const avgAFT = contributedAFTFlow > 0 ? (weightedAFT / contributedAFTFlow) : null;
 
-  // write into hidden summary (so DB saving uses same fields)
   const hiddenTotalFlow = document.querySelector('#summaryHidden #totalFlow') || document.getElementById('totalFlow');
   if(hiddenTotalFlow) hiddenTotalFlow.innerText = Number(totalFlow).toFixed(2);
   const avgGCVEl = document.getElementById('avgGCV'); if(avgGCVEl) avgGCVEl.innerText = totalFlow>0 ? Number(avgGCV).toFixed(2) : 0;
   const avgAFTEl = document.getElementById('avgAFT'); if(avgAFTEl) avgAFTEl.innerText = (avgAFT!==null) ? Number(avgAFT).toFixed(2) : '--';
 
-  // generation (use generationTop)
   const generationVal = parseFloat(document.getElementById('generation')?.value) || 0;
   const heatRateEl = document.getElementById('heatRate');
   if(generationVal > 0 && totalFlow > 0){
@@ -1028,7 +1131,7 @@ if(nextBlendEl){
     if(heatRateEl) heatRateEl.innerText = Number(heatRate).toFixed(2);
   } else { if(heatRateEl) heatRateEl.innerText = '--'; }
 
-  // cost
+  // cost (unchanged)
   const cost1 = (document.getElementById('costBox1')?.value.trim()!=='') ? (parseFloat(document.getElementById('costBox1').value)||0) : ((coal1 && (coal1.cost||coal1.Cost)) ? (parseFloat(coal1.cost||coal1.Cost)||0) : 0);
   const cost2 = (document.getElementById('costBox2')?.value.trim()!=='') ? (parseFloat(document.getElementById('costBox2').value)||0) : ((coal2 && (coal2.cost||coal2.Cost)) ? (parseFloat(coal2.cost||coal2.Cost)||0) : 0);
   const cost3 = (document.getElementById('costBox3')?.value.trim()!=='') ? (parseFloat(document.getElementById('costBox3').value)||0) : ((coal3 && (coal3.cost||coal3.Cost)) ? (parseFloat(coal3.cost||coal3.Cost)||0) : 0);
@@ -1040,7 +1143,7 @@ if(nextBlendEl){
   const costRateEl = document.getElementById('COSTRATE'); if(costRateEl) costRateEl.innerText = Number(costRate).toFixed(2);
 }
 
-/* ---------- Validation & Listeners ---------- */
+/* ---------- Validation & Listeners (preserve original behaviour) ---------- */
 function validateMillPercentages(){
   for(let m=0;m<6;m++){
     let hasPercent=false;
@@ -1053,6 +1156,19 @@ function validateMillPercentages(){
   }
 }
 
+function calculateBlendedForBunker(millIndex){
+  const bunkerCapacity = parseFloat(document.getElementById('bunkerCapacity')?.value)||0;
+  const flow = parseFloat(document.querySelector(`.flow-input[data-mill="${millIndex}"]`)?.value) || 0;
+  const layersSeconds = computeLayerSeconds(millIndex);
+  const existing = bunkerTimers[millIndex];
+  const existingArr = existing ? existing.layersSeconds : null;
+  if(!arraysEqualRounded(existingArr, layersSeconds)){
+    if(layersSeconds.some(s=>s>1)) startOrUpdateBunkerTimer(millIndex, layersSeconds, flow, bunkerCapacity);
+    else clearBunkerTimer(millIndex);
+  }
+  updateBunkerColors();
+}
+
 function attachAutoUpdate(){
   document.querySelectorAll('.percentage-input').forEach(inp=>{
     inp.dataset.prev = inp.value || '';
@@ -1063,21 +1179,45 @@ function attachAutoUpdate(){
       for(let r=1;r<=3;r++) sum += parseFloat(document.querySelector(`.percentage-input[data-row="${r}"][data-mill="${millIndex}"]`)?.value) || 0;
       if(sum > 100){ this.value = this.dataset.prev || ''; alert(`Total for Mill ${String.fromCharCode(65+millIndex)} cannot exceed 100%.`); calculateBlended(); validateMillPercentages(); updateBunkerColors(); return; }
       this.dataset.prev = this.value;
-      calculateBlended(); validateMillPercentages(); updateBunkerColors();
+      // per-bunker recalculation + full blended update (will not restart other unchanged timers)
+      calculateBlendedForBunker(millIndex);
+      calculateBlended();
+      validateMillPercentages();
+      updateBunkerColors();
     });
   });
 
-  // inputs to listen: flows, generationTop, cost, gcv, dropdowns, bunkerCapacity
-  document.querySelectorAll('.flow-input, #generation, .cost-input, .gcv-box, .dropdown, #bunkerCapacity').forEach(el=>{
-    el.addEventListener('input', ()=>{ calculateBlended(); validateMillPercentages(); updateBunkerColors(); });
-    el.addEventListener('change', ()=>{ calculateBlended(); validateMillPercentages(); updateBunkerColors(); });
+  document.querySelectorAll('.flow-input').forEach(fi=>{
+    fi.addEventListener('input', function(){
+      const m = Number(this.dataset.mill);
+      calculateBlendedForBunker(m);
+      calculateBlended();
+      validateMillPercentages();
+      updateBunkerColors();
+    });
+  });
+
+  // global inputs: bunkerCapacity & others
+  document.querySelectorAll('#bunkerCapacity, #generation, .cost-input, .gcv-box, .dropdown').forEach(el=>{
+    el.addEventListener('input', ()=>{
+      calculateBlended();
+      validateMillPercentages();
+      updateBunkerColors();
+    });
+    el.addEventListener('change', ()=>{
+      calculateBlended();
+      validateMillPercentages();
+      updateBunkerColors();
+    });
   });
 
   // initial run
-  calculateBlended(); validateMillPercentages(); updateBunkerColors();
+  calculateBlended();
+  validateMillPercentages();
+  updateBunkerColors();
 }
 
-// /* ---------- Save payload (unchanged fields saved; nextBlend NOT saved) ---------- */
+/* ---------- Save payload (unchanged structure) ---------- */
 // async function savePayload(){
 //   calculateBlended();
 //   const payload = {
@@ -1091,9 +1231,8 @@ function attachAutoUpdate(){
 //     bunkers: []
 //   };
 
-  // Note: nextBlend is NOT included in payload (per your request)
 //   for(let m=0;m<6;m++){
-//     const capacity = 0; // we do not persist per-bunker capacity because only single bunkerCapacity input exists
+//     const capacity = 0;
 //     const flow = parseFloat(document.querySelector(`.flow-input[data-mill="${m}"]`)?.value) || 0;
 //     const p1 = parseFloat(document.querySelector(`.percentage-input[data-row="1"][data-mill="${m}"]`)?.value) || 0;
 //     const p2 = parseFloat(document.querySelector(`.percentage-input[data-row="2"][data-mill="${m}"]`)?.value) || 0;
@@ -1139,10 +1278,8 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 
-
 <!-- external JS (replace with the updated input.js below) -->
 <script src="/public/input.js"></script>
 
 </body>
 </html>
-
